@@ -55,6 +55,13 @@ struct Chart
 	uint32_t material;
 };
 
+struct ChartTransform
+{
+    float matrix[4]; // 2x2
+    float offset[2];
+    uint32_t atlasIndex;
+};
+
 // Output vertex.
 struct Vertex
 {
@@ -75,6 +82,12 @@ struct Mesh
 	uint32_t vertexCount;
 };
 
+struct MeshInstance
+{
+	uint32_t meshIndex;
+	uint32_t chartTransformBase;
+};
+
 static const uint32_t kImageChartIndexMask = 0x1FFFFFFF;
 static const uint32_t kImageHasChartIndexBit = 0x80000000;
 static const uint32_t kImageIsBilinearBit = 0x40000000;
@@ -92,6 +105,11 @@ struct Atlas
 	uint32_t chartCount; // Total number of charts in all meshes.
 	uint32_t meshCount; // Number of output meshes. Equal to the number of times AddMesh was called.
 	float texelsPerUnit; // Equal to PackOptions texelsPerUnit if texelsPerUnit > 0, otherwise an estimated value to match PackOptions resolution.
+
+	MeshInstance *meshInstances;
+	uint32_t meshInstanceCount;
+	ChartTransform *chartTransforms;
+	uint32_t chartTransformCount;
 };
 
 // Create an empty atlas.

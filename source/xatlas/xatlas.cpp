@@ -163,6 +163,12 @@ Copyright (c) 2012 Brandon Pelfrey
 namespace xatlas {
 namespace internal {
 
+struct MeshInstance
+{
+	uint32_t meshIndex;
+	float scale;
+};
+
 static ReallocFunc s_realloc = realloc;
 static FreeFunc s_free = free;
 static PrintFunc s_print = printf;
@@ -8087,14 +8093,41 @@ struct Chart
 	// UvMeshChart only
 	Array<uint32_t> faces;
 
+	uint32_t meshIndex;
+	uint32_t chartIndex;
+	Vector2 transformX;
+	Vector2 transformY;
+	Vector2 transformOffset;
+
 	Vector2 &uniqueVertexAt(uint32_t v) { return uniqueVertices.isEmpty() ? vertices[v] : vertices[uniqueVertices[v]]; }
 	uint32_t uniqueVertexCount() const { return uniqueVertices.isEmpty() ? vertices.length : uniqueVertices.size(); }
+};
+
+struct ChartInstance
+{
+	Chart *chart;
+
+	uint32_t instanceIndex;
+	uint32_t chartIndex;
+
+	int32_t atlasIndex;
+
+	int32_t x;
+	int32_t y;
+	int32_t rotation;
+
+	Vector2 transformX;
+	Vector2 transformY;
+	Vector2 transformOffset;
+
+	float scale;
 };
 
 struct AddChartTaskArgs
 {
 	param::Chart *paramChart;
 	Chart *chart; // out
+	uint32_t meshIndex;
 };
 
 static void runAddChartTask(void *groupUserData, void *taskUserData)
@@ -8108,6 +8141,10 @@ static void runAddChartTask(void *groupUserData, void *taskUserData)
 	XA_PROFILE_END(packChartsAddChartsRestoreTexcoords)
 	Mesh *mesh = paramChart->unifiedMesh();
 	Chart *chart = args->chart = XA_NEW(MemTag::Default, Chart);
+	chart->meshIndex = args->meshIndex;
+	chart->transformX = Vector2(1.0f, 0.0f);
+	chart->transformY = Vector2(0.0f, 1.0f);
+	chart->transformOffset = Vector2(0.0f, 0.0f);
 	chart->atlasIndex = -1;
 	chart->material = 0;
 	chart->indices = mesh->indices();
@@ -8159,10 +8196,12 @@ struct Atlas
 	float getTexelsPerUnit() const { return m_texelsPerUnit; }
 	const Chart *getChart(uint32_t index) const { return m_charts[index]; }
 	uint32_t getChartCount() const { return m_charts.size(); }
+	uint32_t getChartInstanceCount() const { return m_chartInstances.size(); }
+	const ChartInstance &chartInstanceAt(uint32_t index) const { return m_chartInstances[index]; }
 	const Array<AtlasImage *> &getImages() const { return m_atlasImages; }
 	float getUtilization(uint32_t atlas) const { return m_utilization[atlas]; }
 
-	void addCharts(TaskScheduler *taskScheduler, param::Atlas *paramAtlas)
+	void addCharts(TaskScheduler *taskScheduler, param::Atlas *paramAtlas, const Array<internal::MeshInstance> &meshInstances)
 	{
 		// Count charts.
 		uint32_t chartCount = 0;
@@ -8189,6 +8228,7 @@ struct Atlas
 				for (uint32_t k = 0; k < count; k++) {
 					AddChartTaskArgs &args = taskArgs[chartIndex];
 					args.paramChart = chartGroup->chartAt(k);
+					args.meshIndex = i;
 					Task task;
 					task.userData = &taskArgs[chartIndex];
 					task.func = runAddChartTask;
@@ -8200,8 +8240,32 @@ struct Atlas
 		taskScheduler->wait(&taskGroup);
 		// Get task output.
 		m_charts.resize(chartCount);
-		for (uint32_t i = 0; i < chartCount; i++)
+		for (uint32_t i = 0; i < chartCount; i++) {
 			m_charts[i] = taskArgs[i].chart;
+			m_charts[i]->chartIndex = i;
+		}
+
+		for (uint32_t instanceIndex = 0; instanceIndex < meshInstances.size(); instanceIndex++) {
+		    const uint32_t meshIndex = meshInstances[instanceIndex].meshIndex;
+
+		    uint32_t meshChartIndex = 0;
+
+		    for (uint32_t c = 0; c < m_charts.size(); c++) {
+		        Chart *chart = m_charts[c];
+
+		        if (chart->meshIndex != meshIndex)
+		            continue;
+
+		        ChartInstance instance;
+		        instance.chart = chart;
+		        instance.instanceIndex = instanceIndex;
+		        instance.chartIndex = meshChartIndex++;
+		        instance.atlasIndex = -1;
+		        instance.scale = meshInstances[instanceIndex].scale;
+
+		        m_chartInstances.push_back(instance);
+		    }
+		}
 	}
 
 	void addUvMeshCharts(UvMeshInstance *mesh)
@@ -8270,12 +8334,15 @@ struct Atlas
 	// Pack charts in the smallest possible rectangle.
 	bool packCharts(const PackOptions &options, ProgressFunc progressFunc, void *progressUserData)
 	{
+		const Vector2 paddingOffset(0.5f + options.padding, 0.5f + options.padding);
+
 		if (progressFunc) {
 			if (!progressFunc(ProgressCategory::PackCharts, 0, progressUserData))
 				return false;
 		}
 		const uint32_t chartCount = m_charts.size();
-		XA_PRINT("Packing %u charts\n", chartCount);
+		const uint32_t chartInstanceCount = m_chartInstances.size();
+		XA_PRINT("Packing %u chart instances (%u unique charts)\n", chartInstanceCount, chartCount);
 		if (chartCount == 0) {
 			if (progressFunc) {
 				if (!progressFunc(ProgressCategory::PackCharts, 100, progressUserData))
@@ -8291,8 +8358,10 @@ struct Atlas
 			if (resolution <= 0 && m_texelsPerUnit <= 0)
 				resolution = 1024;
 			float meshArea = 0;
-			for (uint32_t c = 0; c < chartCount; c++)
-				meshArea += m_charts[c]->surfaceArea;
+			for (uint32_t i = 0; i < m_chartInstances.size(); i++) {
+				const ChartInstance &instance = m_chartInstances[i];
+			    meshArea += instance.chart->surfaceArea * instance.scale * instance.scale;
+			}
 			if (resolution <= 0) {
 				// Estimate resolution based on the mesh surface area and given texel scale.
 				const float texelCount = max(1.0f, meshArea * square(m_texelsPerUnit) / 0.75f); // Assume 75% utilization.
@@ -8313,7 +8382,7 @@ struct Atlas
 		for (uint32_t c = 0; c < chartCount; c++) {
 			Chart *chart = m_charts[c];
 			// Compute chart scale
-			float scale = 1.0f;
+			float scale = 10.0f;
 			if (chart->parametricArea != 0.0f) {
 				scale = sqrtf(chart->surfaceArea / chart->parametricArea) * m_texelsPerUnit;
 				XA_ASSERT(isFinite(scale));
@@ -8325,6 +8394,22 @@ struct Atlas
 					minCorner = min(minCorner, chart->uniqueVertexAt(i));
 			}
 			Vector2 extents(0.0f);
+
+			if (options.rotateChartsToAxis) {
+				chart->transformX = Vector2(
+				    chart->majorAxis.x,
+				    chart->minorAxis.x);
+
+				chart->transformY = Vector2(
+				    chart->majorAxis.y,
+				    chart->minorAxis.y);
+			    chart->transformOffset = -chart->minCorner;
+			} else {
+			    chart->transformX = Vector2(1.0f, 0.0f);
+			    chart->transformY = Vector2(0.0f, 1.0f);
+			    chart->transformOffset = -minCorner;
+			}
+
 			for (uint32_t i = 0; i < chart->uniqueVertexCount(); i++) {
 				Vector2 &texcoord = chart->uniqueVertexAt(i);
 				if (options.rotateChartsToAxis) {
@@ -8341,6 +8426,11 @@ struct Atlas
 				XA_DEBUG_ASSERT(isFinite(texcoord.x) && isFinite(texcoord.y));
 				extents = max(extents, texcoord);
 			}
+
+			chart->transformX *= scale;
+			chart->transformY *= scale;
+			chart->transformOffset *= scale;
+
 			XA_DEBUG_ASSERT(extents.x >= 0 && extents.y >= 0);
 			// Scale the charts to use the entire texel area available. So, if the width is 0.1 we could scale it to 1 without increasing the lightmap usage and making a better use of it. In many cases this also improves the look of the seams, since vertices on the chart boundaries have more chances of being aligned with the texel centers.
 			if (extents.x > 0.0f && extents.y > 0.0f) {
@@ -8357,6 +8447,19 @@ struct Atlas
 					texcoord.x = texcoord.x / extents.x * (float)width;
 					texcoord.y = texcoord.y / extents.y * (float)height;
 				}
+
+				const float scaleX = (float)width / extents.x;
+				const float scaleY = (float)height / extents.y;
+
+				chart->transformX.x *= scaleX;
+				chart->transformX.y *= scaleY;
+
+				chart->transformY.x *= scaleX;
+				chart->transformY.y *= scaleY;
+
+				chart->transformOffset.x *= scaleX;
+				chart->transformOffset.y *= scaleY;
+
 				extents.x = (float)width;
 				extents.y = (float)height;
 			}
@@ -8378,6 +8481,10 @@ struct Atlas
 						Vector2 &texcoord = chart->uniqueVertexAt(i);
 						texcoord = min(texcoord * scale, Vector2(realMaxChartSize));
 					}
+
+					chart->transformX *= scale;
+					chart->transformY *= scale;
+					chart->transformOffset *= scale;
 				}
 			}
 			// Align to texel centers and add padding offset.
@@ -8388,6 +8495,9 @@ struct Atlas
 				texcoord.y += 0.5f + options.padding;
 				extents = max(extents, texcoord);
 			}
+
+			chart->transformOffset += Vector2(0.5f + options.padding, 0.5f + options.padding);
+
 			if (extents.x > resolution || extents.y > resolution)
 				XA_PRINT("   Chart %u extents are large (%gx%g)\n", c, extents.x, extents.y);
 			chartExtents[c] = extents;
@@ -8395,8 +8505,21 @@ struct Atlas
 			minChartPerimeter = min(minChartPerimeter, chartOrderArray[c]);
 			maxChartPerimeter = max(maxChartPerimeter, chartOrderArray[c]);
 		}
+
+		Array<float> chartInstanceOrderArray;
+        chartInstanceOrderArray.resize(chartInstanceCount);
+
+        for (uint32_t i = 0; i < chartInstanceCount; i++) {
+            ChartInstance &instance = m_chartInstances[i];
+			Chart *chart = instance.chart;
+			const uint32_t c = chart->chartIndex;
+
+			chartInstanceOrderArray[i] =
+			    (chartExtents[c].x + chartExtents[c].y) * instance.scale;
+        }
+
 		// Sort charts by perimeter.
-		m_radix.sort(chartOrderArray);
+		m_radix.sort(chartInstanceOrderArray);
 		const uint32_t *ranks = m_radix.ranks();
 		// Divide chart perimeter range into buckets.
 		const float chartPerimeterBucketSize = (maxChartPerimeter - minChartPerimeter) / 16.0f;
@@ -8419,9 +8542,18 @@ struct Atlas
 		Array<Vector2i> atlasSizes;
 		atlasSizes.push_back(Vector2i(0, 0));
 		int progress = 0;
-		for (uint32_t i = 0; i < chartCount; i++) {
-			uint32_t c = ranks[chartCount - i - 1]; // largest chart first
-			Chart *chart = m_charts[c];
+		for (uint32_t i = 0; i < chartInstanceCount; i++) {
+			const uint32_t instanceIndex = ranks[chartInstanceCount - i - 1];
+			ChartInstance &chartInstance = m_chartInstances[instanceIndex];
+
+			Chart *chart = chartInstance.chart;
+			const uint32_t c = chart->chartIndex;
+
+			const float instanceScale = chartInstance.scale;
+			Vector2 instanceExtents = (chartExtents[c] - paddingOffset) * instanceScale;
+			instanceExtents.x += paddingOffset.x;
+			instanceExtents.y += paddingOffset.y;
+
 			// @@ Add special cases for dot and line charts. @@ Lightmap rasterizer also needs to handle these special cases.
 			// @@ We could also have a special case for chart quads. If the quad surface <= 4 texels, align vertices with texel centers and do not add padding. May be very useful for foliage.
 			// @@ In general we could reduce the padding of all charts by one texel by using a rasterizer that takes into account the 2-texel footprint of the tent bilinear filter. For example,
@@ -8437,7 +8569,7 @@ struct Atlas
 			XA_PROFILE_START(packChartsRasterize)
 			// Resize and clear (discard = true) chart images.
 			// Leave room for padding at extents.
-			chartImage.resize(ftoi_ceil(chartExtents[c].x) + options.padding, ftoi_ceil(chartExtents[c].y) + options.padding, true);
+			chartImage.resize(ftoi_ceil(instanceExtents.x) + options.padding, ftoi_ceil(instanceExtents.y) + options.padding, true);
 			if (options.rotateCharts)
 				chartImageRotated.resize(chartImage.height(), chartImage.width(), true);
 			if (options.bilinear) {
@@ -8449,8 +8581,16 @@ struct Atlas
 			const uint32_t faceCount = chart->indices.length / 3;
 			for (uint32_t f = 0; f < faceCount; f++) {
 				Vector2 vertices[3];
-				for (uint32_t v = 0; v < 3; v++)
-					vertices[v] = chart->vertices[chart->indices[f * 3 + v]];
+				for (uint32_t v = 0; v < 3; v++) {
+				    vertices[v] =
+				        chart->vertices[chart->indices[f * 3 + v]] -
+				        paddingOffset;
+
+				    vertices[v] *= instanceScale;
+
+				    vertices[v].x += paddingOffset.x;
+				    vertices[v].y += paddingOffset.y;
+				}
 				DrawTriangleCallbackArgs args;
 				args.chartBitImage = &chartImage;
 				args.chartBitImageRotated = options.rotateCharts ? &chartImageRotated : nullptr;
@@ -8458,7 +8598,7 @@ struct Atlas
 			}
 			// Expand chart by pixels sampled by bilinear interpolation.
 			if (options.bilinear)
-				bilinearExpand(chart, &chartImage, &chartImageBilinear, options.rotateCharts ? &chartImageBilinearRotated : nullptr, boundaryEdgeGrid);
+				bilinearExpand(chart, instanceScale, paddingOffset, &chartImage, &chartImageBilinear, options.rotateCharts ? &chartImageBilinearRotated : nullptr, boundaryEdgeGrid);
 			// Expand chart by padding pixels (dilation).
 			if (options.padding > 0) {
 				// Copy into the same BitImage instances for every chart to avoid reallocating BitImage buffers (largest chart is packed first).
@@ -8534,6 +8674,27 @@ struct Atlas
 				// Chart doesn't fit in the current bitImage, try the next one.
 				currentAtlas++;
 			}
+
+			chartInstance.atlasIndex = (int32_t)currentAtlas;
+			chartInstance.x = best_x;
+			chartInstance.y = best_y;
+			chartInstance.rotation = best_r;
+
+			chartInstance.transformX = chart->transformX * instanceScale;
+			chartInstance.transformY = chart->transformY * instanceScale;
+			chartInstance.transformOffset = (chart->transformOffset - paddingOffset) * instanceScale;
+			chartInstance.transformOffset.x += paddingOffset.x;
+			chartInstance.transformOffset.y += paddingOffset.y;
+
+			if (best_r) {
+			    swap(chartInstance.transformX.x, chartInstance.transformX.y);
+			    swap(chartInstance.transformY.x, chartInstance.transformY.y);
+			    swap(chartInstance.transformOffset.x, chartInstance.transformOffset.y);
+			}
+
+			chartInstance.transformOffset.x += best_x - (float)options.padding;
+			chartInstance.transformOffset.y += best_y - (float)options.padding;
+
 			// Update brute force start location.
 			if (options.bruteForce) {
 				// Reset start location if the chart expanded the atlas.
@@ -8579,11 +8740,12 @@ struct Atlas
 				}
 #endif
 			}
-			chart->atlasIndex = (int32_t)currentAtlas;
+			// chart->atlasIndex = (int32_t)currentAtlas;
 			// Modify texture coordinates:
 			//  - rotate if the chart should be rotated
 			//  - translate to chart location
 			//  - translate to remove padding from top and left atlas edges (unless block aligned)
+			/*
 			for (uint32_t v = 0; v < chart->uniqueVertexCount(); v++) {
 				Vector2 &texcoord = chart->uniqueVertexAt(v);
 				Vector2 t = texcoord;
@@ -8598,8 +8760,9 @@ struct Atlas
 				XA_ASSERT(texcoord.x >= 0 && texcoord.y >= 0);
 				XA_ASSERT(isFinite(texcoord.x) && isFinite(texcoord.y));
 			}
+			*/
 			if (progressFunc) {
-				const int newProgress = int((i + 1) / (float)chartCount * 100.0f);
+				const int newProgress = int((i + 1) / (float)chartInstanceCount * 100.0f);
 				if (newProgress != progress) {
 					progress = newProgress;
 					if (!progressFunc(ProgressCategory::PackCharts, progress, progressUserData))
@@ -8783,9 +8946,19 @@ private:
 		}
 	}
 
-	void bilinearExpand(const Chart *chart, BitImage *source, BitImage *dest, BitImage *destRotated, UniformGrid2 &boundaryEdgeGrid) const
+	void bilinearExpand(const Chart *chart, float instanceScale, const Vector2 &paddingOffset, BitImage *source, BitImage *dest, BitImage *destRotated, UniformGrid2 &boundaryEdgeGrid) const
 	{
-		boundaryEdgeGrid.reset(chart->vertices, chart->indices);
+		Array<Vector2> scaledVertices;
+		scaledVertices.resize(chart->vertices.length);
+
+		for (uint32_t i = 0; i < chart->vertices.length; i++) {
+		    scaledVertices[i] = (chart->vertices[i] - paddingOffset) * instanceScale;
+		    scaledVertices[i].x += paddingOffset.x;
+		    scaledVertices[i].y += paddingOffset.y;
+		}
+
+		boundaryEdgeGrid.reset(scaledVertices, chart->indices);
+
 		if (chart->boundaryEdges) {
 			const uint32_t edgeCount = chart->boundaryEdges->size();
 			for (uint32_t i = 0; i < edgeCount; i++)
@@ -8862,6 +9035,8 @@ private:
 	uint32_t m_height = 0;
 	float m_texelsPerUnit = 0.0f;
 	KISSRng m_rand;
+
+	Array<ChartInstance> m_chartInstances;
 };
 
 } // namespace pack
@@ -8889,6 +9064,8 @@ struct Context
 	internal::Array<internal::UvMesh *> uvMeshes;
 	internal::Array<internal::UvMeshInstance *> uvMeshInstances;
 	bool uvMeshChartsComputed = false;
+
+	internal::Array<internal::MeshInstance> meshInstances;
 };
 
 Atlas *Create()
@@ -8926,9 +9103,14 @@ void Destroy(Atlas *atlas)
 	XA_DEBUG_ASSERT(atlas);
 	Context *ctx = (Context *)atlas;
 	if (atlas->utilization)
-		XA_FREE(atlas->utilization);
+	    XA_FREE(atlas->utilization);
 	if (atlas->image)
-		XA_FREE(atlas->image);
+	    XA_FREE(atlas->image);
+	if (atlas->meshInstances)
+	    XA_FREE(atlas->meshInstances);
+	if (atlas->chartTransforms)
+	    XA_FREE(atlas->chartTransforms);
+
 	DestroyOutputMeshes(ctx);
 	if (ctx->addMeshProgress) {
 		ctx->addMeshProgress->cancel = true;
@@ -9209,6 +9391,21 @@ AddMeshError AddMesh(Atlas *atlas, const MeshDecl &meshDecl, uint32_t meshCountH
 	task.func = runAddMeshTask;
 	ctx->taskScheduler->run(ctx->addMeshTaskGroup, task);
 	return AddMeshError::Success;
+}
+
+uint32_t AddMeshInstance(Atlas* atlas, uint32_t meshIndex, float scale)
+{
+	XA_ASSERT(scale > 0.0f);
+
+	Context* ctx = (Context*) atlas;
+	internal::MeshInstance instance;
+	instance.meshIndex = meshIndex;
+	instance.scale = scale;
+
+	const uint32_t instanceIndex = ctx->meshInstances.size();
+	ctx->meshInstances.push_back(instance);
+
+	return instanceIndex;
 }
 
 void AddMeshJoin(Atlas *atlas)
@@ -9581,6 +9778,19 @@ void PackCharts(Atlas *atlas, PackOptions packOptions)
 		XA_FREE(atlas->image);
 		atlas->image = nullptr;
 	}
+	if (atlas->meshInstances) {
+	    XA_FREE(atlas->meshInstances);
+	    atlas->meshInstances = nullptr;
+	}
+
+	if (atlas->chartTransforms) {
+	    XA_FREE(atlas->chartTransforms);
+	    atlas->chartTransforms = nullptr;
+	}
+
+	atlas->meshInstanceCount = 0;
+	atlas->chartTransformCount = 0;
+
 	atlas->meshCount = 0;
 	// Pack charts.
 	XA_PROFILE_START(packChartsAddCharts)
@@ -9590,18 +9800,91 @@ void PackCharts(Atlas *atlas, PackOptions packOptions)
 			packAtlas.addUvMeshCharts(ctx->uvMeshInstances[i]);
 	}
 	else
-		packAtlas.addCharts(ctx->taskScheduler, &ctx->paramAtlas);
+		packAtlas.addCharts(ctx->taskScheduler, &ctx->paramAtlas, ctx->meshInstances);
 	XA_PROFILE_END(packChartsAddCharts)
 	XA_PROFILE_START(packCharts)
 	if (!packAtlas.packCharts(packOptions, ctx->progressFunc, ctx->progressUserData))
 		return;
 	XA_PROFILE_END(packCharts)
+
+	// Restore canonical shared UVs.
+	if (ctx->uvMeshInstances.isEmpty()) {
+	    for (uint32_t i = 0; i < ctx->meshes.size(); i++) {
+	        for (uint32_t cg = 0; cg < ctx->paramAtlas.chartGroupCount(i); cg++) {
+				const internal::param::ChartGroup *chartGroup =
+				    ctx->paramAtlas.chartGroupAt(i, cg);
+
+	            for (uint32_t c = 0; c < chartGroup->chartCount(); c++)
+	                chartGroup->chartAt(c)->restoreTexcoords();
+	        }
+	    }
+	}
+
 	// Populate atlas object with pack results.
 	atlas->atlasCount = packAtlas.getNumAtlases();
 	atlas->chartCount = packAtlas.getChartCount();
 	atlas->width = packAtlas.getWidth();
 	atlas->height = packAtlas.getHeight();
 	atlas->texelsPerUnit = packAtlas.getTexelsPerUnit();
+	atlas->meshInstances = nullptr;
+	atlas->chartTransformCount = packAtlas.getChartInstanceCount();
+	atlas->chartTransforms = XA_ALLOC_ARRAY(internal::MemTag::Default, ChartTransform, atlas->chartTransformCount);
+
+	for (uint32_t i = 0; i < atlas->chartTransformCount; i++) {
+	    const internal::pack::ChartInstance &src =
+	        packAtlas.chartInstanceAt(i);
+
+	    ChartTransform &dst = atlas->chartTransforms[i];
+
+	    dst.matrix[0] = src.transformX.x / atlas->width;
+	    dst.matrix[1] = src.transformY.x / atlas->width;
+	    dst.matrix[2] = src.transformX.y / atlas->height;
+	    dst.matrix[3] = src.transformY.y / atlas->height;
+
+	    dst.offset[0] = src.transformOffset.x / atlas->width;
+	    dst.offset[1] = src.transformOffset.y / atlas->height;
+
+	    dst.atlasIndex = (uint32_t)src.atlasIndex;
+	}
+
+	atlas->meshInstanceCount = ctx->meshInstances.size();
+	atlas->meshInstances = XA_ALLOC_ARRAY(internal::MemTag::Default, MeshInstance, atlas->meshInstanceCount);
+
+	for (uint32_t i = 0; i < atlas->meshInstanceCount; i++) {
+	    MeshInstance &dst = atlas->meshInstances[i];
+
+	    dst.meshIndex = ctx->meshInstances[i].meshIndex;
+	    dst.chartTransformBase = UINT32_MAX;
+
+	    for (uint32_t t = 0; t < packAtlas.getChartInstanceCount(); t++) {
+	        const internal::pack::ChartInstance &src =
+	            packAtlas.chartInstanceAt(t);
+
+	        if (src.instanceIndex == i) {
+	            dst.chartTransformBase = t;
+	            break;
+	        }
+	    }
+
+	    if (dst.chartTransformBase != UINT32_MAX) {
+	        uint32_t expectedLocalChartIndex = 0;
+
+	        for (uint32_t t = dst.chartTransformBase;
+	             t < packAtlas.getChartInstanceCount();
+	             t++)
+	        {
+	            const internal::pack::ChartInstance &src =
+	                packAtlas.chartInstanceAt(t);
+
+	            if (src.instanceIndex != i)
+	                break;
+
+	            XA_DEBUG_ASSERT(src.chartIndex == expectedLocalChartIndex);
+	            expectedLocalChartIndex++;
+	        }
+	    }
+	}
+
 	if (atlas->atlasCount > 0) {
 		atlas->utilization = XA_ALLOC_ARRAY(internal::MemTag::Default, float, atlas->atlasCount);
 		for (uint32_t i = 0; i < atlas->atlasCount; i++)
@@ -9732,12 +10015,12 @@ void PackCharts(Atlas *atlas, PackOptions packOptions)
 					// Vertices.
 					for (uint32_t v = 0; v < chart->originalVertexCount(); v++) {
 						Vertex &vertex = outputMesh.vertexArray[firstVertex + v];
-						vertex.atlasIndex = packAtlas.getChart(chartIndex)->atlasIndex;
-						XA_DEBUG_ASSERT(vertex.atlasIndex >= 0);
-						vertex.chartIndex = (int32_t)chartIndex;
+						vertex.atlasIndex = -1;
+						// XA_DEBUG_ASSERT(vertex.atlasIndex >= 0);
+						vertex.chartIndex = (int32_t)meshChartIndex;
 						const internal::Vector2 &uv = unifiedMesh->texcoord(chart->originalVertexToUnifiedVertex(v));
-						vertex.uv[0] = internal::max(0.0f, uv.x);
-						vertex.uv[1] = internal::max(0.0f, uv.y);
+						vertex.uv[0] = uv.x;
+						vertex.uv[1] = uv.y;
 						vertex.xref = chart->mapChartVertexToSourceVertex(v);
 					}
 					// Indices.
@@ -9752,9 +10035,7 @@ void PackCharts(Atlas *atlas, PackOptions packOptions)
 					}
 					// Charts.
 					Chart *outputChart = &outputMesh.chartArray[meshChartIndex];
-					const int32_t atlasIndex = packAtlas.getChart(chartIndex)->atlasIndex;
-					XA_DEBUG_ASSERT(atlasIndex >= 0);
-					outputChart->atlasIndex = (uint32_t)atlasIndex;
+					outputChart->atlasIndex = UINT32_MAX;
 					outputChart->type = chart->isInvalid() ? ChartType::Invalid : chart->type();
 					if (meshPolygonMapping) {
 						// Count polygons.
@@ -9935,8 +10216,10 @@ const char *StringForEnum(ProgressCategory category)
 
 #if XATLAS_C_API
 static_assert(sizeof(xatlas::Chart) == sizeof(xatlasChart), "xatlasChart size mismatch");
+static_assert(sizeof(xatlas::ChartTransform) == sizeof(xatlasChartTransform), "xatlasChartTransform size mismatch");
 static_assert(sizeof(xatlas::Vertex) == sizeof(xatlasVertex), "xatlasVertex size mismatch");
 static_assert(sizeof(xatlas::Mesh) == sizeof(xatlasMesh), "xatlasMesh size mismatch");
+static_assert(sizeof(xatlas::MeshInstance) == sizeof(xatlasMeshInstance), "xatlasMeshInstance size mismatch");
 static_assert(sizeof(xatlas::Atlas) == sizeof(xatlasAtlas), "xatlasAtlas size mismatch");
 static_assert(sizeof(xatlas::MeshDecl) == sizeof(xatlasMeshDecl), "xatlasMeshDecl size mismatch");
 static_assert(sizeof(xatlas::UvMeshDecl) == sizeof(xatlasUvMeshDecl), "xatlasUvMeshDecl size mismatch");
@@ -9960,6 +10243,11 @@ void xatlasDestroy(xatlasAtlas *atlas)
 xatlasAddMeshError xatlasAddMesh(xatlasAtlas *atlas, const xatlasMeshDecl *meshDecl, uint32_t meshCountHint)
 {
 	return (xatlasAddMeshError)xatlas::AddMesh((xatlas::Atlas *)atlas, *(const xatlas::MeshDecl *)meshDecl, meshCountHint);
+}
+
+XATLAS_API uint32_t xatlasAddMeshInstance(xatlasAtlas *atlas, uint32_t meshIndex, float scale)
+{
+	return xatlas::AddMeshInstance((xatlas::Atlas *)atlas, meshIndex, scale);
 }
 
 void xatlasAddMeshJoin(xatlasAtlas *atlas)

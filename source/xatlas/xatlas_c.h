@@ -105,10 +105,25 @@ typedef struct
 }
 xatlasMesh;
 
+typedef struct
+{
+	uint32_t meshIndex;
+	uint32_t chartTransformBase;
+}
+xatlasMeshInstance;
+
 static const uint32_t xatlasImageChartIndexMask = 0x1FFFFFFF;
 static const uint32_t xatlasImageHasChartIndexBit = 0x80000000;
 static const uint32_t xatlasImageIsBilinearBit = 0x40000000;
 static const uint32_t xatlasImageIsPaddingBit = 0x20000000;
+
+typedef struct
+{
+    float matrix[4]; // 2x2
+    float offset[2];
+    uint32_t atlasIndex;
+}
+xatlasChartTransform;
 
 typedef struct
 {
@@ -121,6 +136,11 @@ typedef struct
 	uint32_t chartCount;
 	uint32_t meshCount;
 	float texelsPerUnit;
+
+	xatlasMeshInstance *meshInstances;
+	uint32_t meshInstanceCount;
+	xatlasChartTransform *chartTransforms;
+	uint32_t chartTransformCount;
 }
 xatlasAtlas;
 
@@ -226,6 +246,7 @@ typedef int (*xatlasPrintFunc)(const char *, ...);
 XATLAS_API xatlasAtlas *xatlasCreate();
 XATLAS_API void xatlasDestroy(xatlasAtlas *atlas);
 XATLAS_API xatlasAddMeshError xatlasAddMesh(xatlasAtlas *atlas, const xatlasMeshDecl *meshDecl, uint32_t meshCountHint);
+XATLAS_API uint32_t xatlasAddMeshInstance(xatlasAtlas *atlas, uint32_t meshIndex, float scale);
 XATLAS_API void xatlasAddMeshJoin(xatlasAtlas *atlas);
 XATLAS_API xatlasAddMeshError xatlasAddUvMesh(xatlasAtlas *atlas, const xatlasUvMeshDecl *decl);
 XATLAS_API void xatlasComputeCharts(xatlasAtlas *atlas, const xatlasChartOptions *chartOptions);
